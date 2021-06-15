@@ -7,25 +7,27 @@ import {
   labelClosedPR,
 } from './utils';
 import { labelToTargetBranch, labelExistsOnPR } from './utils/label-utils';
-import { CHECK_PREFIX, SKIP_CHECK_LABEL } from './constants';
+import { CHECK_PREFIX, NO_BACKPORT_LABEL, SKIP_CHECK_LABEL } from './constants';
 import { getEnvVar } from './utils/env-util';
 import { PRChange, PRStatus, BackportPurpose, CheckRunStatus } from './enums';
-import {
-  ChecksListForRefResponseCheckRunsItem,
-  PullsGetResponse,
-} from '@octokit/rest';
+import { Octokit } from '@octokit/rest';
 import {
   backportToLabel,
   backportToBranch,
 } from './operations/backport-to-location';
 import { updateManualBackport } from './operations/update-manual-backport';
 import { getSupportedBranches, getBackportPattern } from './utils/branch-util';
-import { updateBackportValidityCheck } from './utils/checks-util';
+import {
+  getBackportInformationCheck,
+  queueBackportInformationCheck,
+  updateBackportInformationCheck,
+  updateBackportValidityCheck,
+} from './utils/checks-util';
 
 const probotHandler = async (robot: Application) => {
   const handleClosedPRLabels = async (
     context: Context,
-    pr: PullsGetResponse,
+    pr: Octokit.PullsGetResponse,
     change: PRChange,
   ) => {
     for (const label of pr.labels) {
@@ -38,7 +40,10 @@ const probotHandler = async (robot: Application) => {
     }
   };
 
-  const backportAllLabels = (context: Context, pr: PullsGetResponse) => {
+  const backportAllLabels = (
+    context: Context,
+    pr: Octokit.PullsGetResponse,
+  ) => {
     for (const label of pr.labels) {
       context.payload.pull_request = context.payload.pull_request || pr;
       backportToLabel(robot, context, label);
@@ -47,7 +52,7 @@ const probotHandler = async (robot: Application) => {
 
   const handleTropBackportClosed = async (
     context: Context,
-    pr: PullsGetResponse,
+    pr: Octokit.PullsGetResponse,
     change: PRChange,
   ) => {
     const closeType = change === PRChange.MERGE ? 'merged' : 'closed';
@@ -66,7 +71,7 @@ const probotHandler = async (robot: Application) => {
     }
   };
 
-  const runCheck = async (context: Context, pr: PullsGetResponse) => {
+  const runCheck = async (context: Context, pr: Octokit.PullsGetResponse) => {
     const allChecks = await context.github.checks.listForRef(
       context.repo({
         ref: pr.head.sha,
@@ -109,8 +114,8 @@ const probotHandler = async (robot: Application) => {
     for (const checkRun of checkRuns) {
       if (
         !pr.labels.find(
-          (label) =>
-            label.name ===
+          (prLabel) =>
+            prLabel.name ===
             `${PRStatus.TARGET}${checkRun.name.replace(CHECK_PREFIX, '')}`,
         )
       ) {
@@ -130,6 +135,67 @@ const probotHandler = async (robot: Application) => {
     if (!payload.pull_request.merged) {
       await runCheck(context, payload.pull_request as any);
     }
+  };
+
+  /**
+   * Checks that a PR done to `master` contains the required
+   * backport information, i.e.: at least a `no-backport` or
+   * a `target/XYZ` labels.
+   *
+   * @param context
+   * @returns
+   */
+  const backportInformationCheck = async (context: Context) => {
+    const pr: Octokit.PullsGetResponse = context.payload.pull_request;
+
+    if (pr.base.ref !== 'master') {
+      return;
+    }
+
+    let backportCheck = await getBackportInformationCheck(context);
+
+    if (!backportCheck) {
+      await queueBackportInformationCheck(context);
+      backportCheck = (await getBackportInformationCheck(context))!;
+    }
+
+    const isNoBackport = pr.labels.some(
+      (prLabel) => prLabel.name === NO_BACKPORT_LABEL,
+    );
+    const hasTarget = pr.labels.some(
+      (prLabel) =>
+        prLabel.name.startsWith(PRStatus.TARGET) ||
+        prLabel.name.startsWith(PRStatus.IN_FLIGHT) ||
+        prLabel.name.startsWith(PRStatus.MERGED),
+    );
+
+    if (hasTarget && isNoBackport) {
+      await updateBackportInformationCheck(context, backportCheck, {
+        title: 'Conflicting Backport Information',
+        summary:
+          'The PR has a "no-backport" and at least one "target/x-y-z" label. Impossible to determine backport action.',
+        conclusion: CheckRunStatus.FAILURE,
+      });
+
+      return;
+    }
+
+    if (!hasTarget && !isNoBackport) {
+      await updateBackportInformationCheck(context, backportCheck, {
+        title: 'Missing Backport Information',
+        summary:
+          'This PR is missing the required backport information. It should have a "no-backport" or a "target/x-y-z" label.',
+        conclusion: CheckRunStatus.FAILURE,
+      });
+
+      return;
+    }
+
+    await updateBackportInformationCheck(context, backportCheck, {
+      title: 'Backport Information Provided',
+      summary: 'This PR contains the required  backport information.',
+      conclusion: CheckRunStatus.SUCCESS,
+    });
   };
 
   const VALID_BACKPORT_CHECK_NAME = 'Valid Backport';
@@ -176,16 +242,16 @@ const probotHandler = async (robot: Application) => {
       if (pr.base.ref !== 'master') {
         if (!checkRun) {
           robot.log(`Queueing new check run for #${pr.number}`);
-          checkRun = ((
-            await context.github.checks.create(
-              context.repo({
-                name: VALID_BACKPORT_CHECK_NAME,
-                head_sha: pr.head.sha,
-                status: 'queued' as 'queued',
-                details_url: 'https://github.com/electron/trop',
-              }),
-            )
-          ).data as any) as ChecksListForRefResponseCheckRunsItem;
+          const response = await context.github.checks.create(
+            context.repo({
+              name: VALID_BACKPORT_CHECK_NAME,
+              head_sha: pr.head.sha,
+              status: 'queued' as 'queued',
+              details_url: 'https://github.com/electron/trop',
+            }),
+          );
+
+          checkRun = (response.data as any) as Octokit.ChecksListForRefResponseCheckRunsItem;
         }
 
         // If a branch is targeting something that isn't master it might not be a backport;
@@ -328,9 +394,19 @@ const probotHandler = async (robot: Application) => {
   robot.on('pull_request.labeled', maybeRunCheck);
   robot.on('pull_request.unlabeled', maybeRunCheck);
 
+  robot.on(
+    [
+      'pull_request.opened',
+      'pull_request.reopened',
+      'pull_request.labeled',
+      'pull_request.unlabeled',
+    ],
+    backportInformationCheck,
+  );
+
   // Backport pull requests to labeled targets when PR is merged.
   robot.on('pull_request.closed', async (context: Context) => {
-    const pr: PullsGetResponse = context.payload.pull_request;
+    const pr: Octokit.PullsGetResponse = context.payload.pull_request;
     const oldPRNumbers = getPRNumbersFromPRBody(pr, true);
     if (pr.merged) {
       if (oldPRNumbers.length > 0) {

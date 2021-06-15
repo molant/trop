@@ -1,11 +1,5 @@
 import { Application, Context } from 'probot';
-import {
-  PullsGetResponse,
-  ChecksListForRefResponseCheckRunsItem,
-  PullsGetResponseBase,
-  ChecksUpdateParams,
-  PullsListCommitsResponseItem,
-} from '@octokit/rest';
+import { Octokit } from '@octokit/rest';
 import fetch from 'node-fetch';
 import * as fs from 'fs-extra';
 import { IQueue } from 'queue';
@@ -36,7 +30,7 @@ const { parse: parseDiff } = require('what-the-diff');
 
 export const labelClosedPR = async (
   context: Context,
-  pr: PullsGetResponse,
+  pr: Octokit.PullsGetResponse,
   targetBranch: String,
   change: PRChange,
 ) => {
@@ -73,11 +67,14 @@ const tryBackportAllCommits = async (opts: TryBackportOptions) => {
     `Getting rev list from: ${opts.pr.base.sha}..${opts.pr.head.sha}`,
   );
 
+  const { context } = opts;
+  if (!context) return;
+
   const commits = (
-    await opts.context!.github.pulls.listCommits(
-      opts.context!.repo({ pull_number: opts.pr.number }),
+    await context.github.pulls.listCommits(
+      context.repo({ pull_number: opts.pr.number }),
     )
-  ).data.map((commit: PullsListCommitsResponseItem) => commit.sha);
+  ).data.map((commit: Octokit.PullsListCommitsResponseItem) => commit.sha);
 
   if (commits.length === 0) {
     log(
@@ -95,8 +92,8 @@ const tryBackportAllCommits = async (opts: TryBackportOptions) => {
       LogLevel.ERROR,
       `Too many commits (${commits.length})...backport will not be performed.`,
     );
-    await opts.context!.github.issues.createComment(
-      opts.context!.repo({
+    await context.github.issues.createComment(
+      context.repo({
         issue_number: opts.pr.number,
         body:
           'This PR has exceeded the automatic backport commit limit \
@@ -226,7 +223,7 @@ export const isAuthorizedUser = async (context: Context, username: string) => {
 };
 
 export const getPRNumbersFromPRBody = (
-  pr: PullsGetResponse,
+  pr: Octokit.PullsGetResponse,
   checkNotBot = false,
 ) => {
   const backportNumbers: number[] = [];
@@ -263,7 +260,7 @@ export const getPRNumbersFromPRBody = (
  */
 const getOriginalBackportNumber = async (
   context: Context,
-  pr: PullsGetResponse,
+  pr: Octokit.PullsGetResponse,
 ) => {
   let originalPR = pr;
   let match: RegExpExecArray | null;
@@ -290,7 +287,7 @@ const getOriginalBackportNumber = async (
 
 export const isSemverMinorPR = async (
   context: Context,
-  pr: PullsGetResponse,
+  pr: Octokit.PullsGetResponse,
 ) => {
   log(
     'isSemverMinorPR',
@@ -328,7 +325,7 @@ const checkUserHasWriteAccess = async (context: Context, user: string) => {
 
 const createBackportComment = async (
   context: Context,
-  pr: PullsGetResponse,
+  pr: Octokit.PullsGetResponse,
 ) => {
   const prNumber = await getOriginalBackportNumber(context, pr);
 
@@ -387,7 +384,7 @@ export const backportImpl = async (
     }
   }
 
-  const base: PullsGetResponseBase = context.payload.pull_request.base;
+  const base: Octokit.PullsGetResponseBase = context.payload.pull_request.base;
   const slug = `${base.repo.owner.login}/${base.repo.name}`;
   const bp = `backport from PR #${context.payload.pull_request.number} to "${targetBranch}"`;
   log('backportImpl', LogLevel.INFO, `Queuing ${bp} for "${slug}"`);
@@ -401,7 +398,7 @@ export const backportImpl = async (
     );
 
     return allChecks.data.check_runs.find(
-      (run: ChecksListForRefResponseCheckRunsItem) => {
+      (run: Octokit.ChecksListForRefResponseCheckRunsItem) => {
         return run.name === `${CHECK_PREFIX}${targetBranch}`;
       },
     );
@@ -428,7 +425,7 @@ export const backportImpl = async (
 
       const repoAccessToken = await getRepoToken(robot, context);
 
-      const pr: PullsGetResponse = context.payload.pull_request;
+      const pr: Octokit.PullsGetResponse = context.payload.pull_request;
 
       // Set up empty repo on master.
       const { dir } = await initRepo({
@@ -481,13 +478,16 @@ export const backportImpl = async (
         });
       }
 
-      // Note if neither succeeded.
+      // Throw if neither succeeded - if we don't we
+      // never enter the ErrorExecutor and the check hangs.
       if (!success) {
         log(
           'backportImpl',
           LogLevel.ERROR,
           `Cherry picking commits to branch failed`,
         );
+
+        throw new Error(`Cherry picking commit(s) to branch failed`);
       }
 
       if (purpose === BackportPurpose.ExecuteBackport) {
@@ -535,10 +535,6 @@ export const backportImpl = async (
           }),
         );
 
-        if (labelToRemove) {
-          await labelUtils.removeLabel(context, pr.number, labelToRemove);
-        }
-
         // TODO(codebytere): getOriginalBackportNumber doesn't support multi-backports yet,
         // so only try if the backport is a single backport.
         const backportNumbers = getPRNumbersFromPRBody(pr);
@@ -546,6 +542,14 @@ export const backportImpl = async (
           backportNumbers.length === 1
             ? await getOriginalBackportNumber(context, pr)
             : pr.number;
+
+        if (labelToRemove) {
+          await labelUtils.removeLabel(
+            context,
+            originalPRNumber,
+            labelToRemove,
+          );
+        }
 
         if (labelToAdd) {
           await labelUtils.addLabels(context, originalPRNumber, [labelToAdd]);
@@ -662,7 +666,7 @@ export const backportImpl = async (
         const checkRun = await getCheckRun();
         if (checkRun) {
           const mdSep = '``````````````````````````````';
-          const updateOpts: ChecksUpdateParams = context.repo({
+          const updateOpts: Octokit.ChecksUpdateParams = context.repo({
             check_run_id: checkRun.id,
             name: checkRun.name,
             conclusion: 'neutral' as 'neutral',
